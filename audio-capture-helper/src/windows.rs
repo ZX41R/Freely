@@ -10,7 +10,11 @@ use crate::{write_pcm_header, AudioDevice, CHANNELS, SAMPLE_RATE};
 // ~128 ms of 16 kHz mono audio per write, which keeps the pipe cheap without
 // adding latency the VAD would notice.
 const CHUNK_BYTES: usize = 4096;
-const EVENT_TIMEOUT_MS: u32 = 3000;
+
+// Shared-mode events arrive every ~10 ms while the endpoint is running, so
+// going this long without one means it has stopped.
+const IDLE_TIMEOUT_MS: u32 = 200;
+const IDLE_BYTES: usize = SAMPLE_RATE * CHANNELS * 2 * IDLE_TIMEOUT_MS as usize / 1000;
 
 fn wasapi_err(context: &str, e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("{context}: {e}"))
@@ -131,28 +135,44 @@ pub fn capture(requested: &str) -> io::Result<()> {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    // The daemon going away closes our stdout. That is a normal exit.
+    let mut send = |bytes: &[u8]| out.write_all(bytes).and_then(|()| out.flush()).is_ok();
     let mut queue: VecDeque<u8> = VecDeque::with_capacity(CHUNK_BYTES * 8);
-    let mut warned_idle = false;
 
-    loop {
-        capture_client
-            .read_from_device_to_deque(&mut queue)
-            .map_err(|e| wasapi_err("capture read failed", e))?;
+    'capture: loop {
+        // One wake-up can have several packets waiting and each read takes
+        // exactly one, so drain them all or the backlog gets dropped. A device
+        // that went away shows up here as an error and ends the run.
+        while capture_client
+            .get_next_packet_size()
+            .map_err(|e| wasapi_err("capture read failed", e))?
+            .is_some_and(|frames| frames > 0)
+        {
+            capture_client
+                .read_from_device_to_deque(&mut queue)
+                .map_err(|e| wasapi_err("capture read failed", e))?;
+        }
 
         while queue.len() >= CHUNK_BYTES {
             let chunk: Vec<u8> = queue.drain(..CHUNK_BYTES).collect();
-            // The daemon going away closes our stdout. That is a normal exit.
-            if out.write_all(&chunk).and_then(|()| out.flush()).is_err() {
-                let _ = client.stop_stream();
-                return Ok(());
+            if !send(&chunk) {
+                break 'capture;
             }
         }
 
-        if event.wait_for_event(EVENT_TIMEOUT_MS).is_err() && !warned_idle {
-            // A loopback stream stops producing buffers when nothing at all is
-            // playing on that endpoint. Not an error, so keep waiting.
-            eprintln!("no audio for {EVENT_TIMEOUT_MS}ms — endpoint idle, still listening");
-            warned_idle = true;
+        if event.wait_for_event(IDLE_TIMEOUT_MS).is_err() {
+            // A loopback endpoint delivers nothing at all while nothing is
+            // playing, where a PulseAudio monitor would keep sending silence.
+            // The VAD closes a segment by counting silent frames, so stand in
+            // for the missing audio or the last sentence never gets flushed.
+            let mut tail: Vec<u8> = queue.drain(..).collect();
+            tail.resize(tail.len() + IDLE_BYTES, 0);
+            if !send(&tail) {
+                break 'capture;
+            }
         }
     }
+
+    let _ = client.stop_stream();
+    Ok(())
 }
